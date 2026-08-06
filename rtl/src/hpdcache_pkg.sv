@@ -54,7 +54,7 @@ package hpdcache_pkg;
         HPDCACHE_REQ_AMO_MAXU              = 5'h0c,
         HPDCACHE_REQ_AMO_MIN               = 5'h0d,
         HPDCACHE_REQ_AMO_MINU              = 5'h0e,
-        // RESERVED                        = 5'h0f,
+        HPDCACHE_REQ_AMO_CAS               = 5'h0f,  // Zacas AMOCAS (packed cmp||swap)
         HPDCACHE_REQ_CMO_FENCE             = 5'h10,
         HPDCACHE_REQ_CMO_PREFETCH          = 5'h11,
         HPDCACHE_REQ_CMO_INVAL_NLINE       = 5'h12,
@@ -123,11 +123,16 @@ package hpdcache_pkg;
             HPDCACHE_REQ_AMO_MAX,
             HPDCACHE_REQ_AMO_MAXU,
             HPDCACHE_REQ_AMO_MIN,
-            HPDCACHE_REQ_AMO_MINU:
+            HPDCACHE_REQ_AMO_MINU,
+            HPDCACHE_REQ_AMO_CAS:
                 return 1'b1;
             default:
                 return 1'b0;
         endcase
+    endfunction
+
+    function automatic logic is_amo_cas(input hpdcache_req_op_t op);
+        return (op == HPDCACHE_REQ_AMO_CAS);
     endfunction
 
     function automatic logic is_amo_lr(input hpdcache_req_op_t op);
@@ -287,7 +292,7 @@ package hpdcache_pkg;
         HPDCACHE_MEM_ATOMIC_UMAX = 4'b0110,
         HPDCACHE_MEM_ATOMIC_UMIN = 4'b0111,
         HPDCACHE_MEM_ATOMIC_SWAP = 4'b1000,
-        //  Reserved           = 4'b1001,
+        HPDCACHE_MEM_ATOMIC_CMP  = 4'b1001,  // Zacas AMOCAS → AXI ATOP_ATOMICCMP
         //  Reserved           = 4'b1010,
         //  Reserved           = 4'b1011,
         HPDCACHE_MEM_ATOMIC_LDEX = 4'b1100,
@@ -330,6 +335,7 @@ package hpdcache_pkg;
         logic is_amo_maxu;
         logic is_amo_min;
         logic is_amo_minu;
+        logic is_amo_cas;  // Zacas AMOCAS
     } hpdcache_uc_op_t;
     //  }}}
 

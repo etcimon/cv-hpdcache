@@ -392,6 +392,7 @@ import hpdcache_pkg::*;
     logic                    st1_req_is_amo_maxu;
     logic                    st1_req_is_amo_min;
     logic                    st1_req_is_amo_minu;
+    logic                    st1_req_is_amo_cas;
     logic                    st1_req_is_cmo_inval;
     logic                    st1_req_is_cmo_flush;
     logic                    st1_req_is_cmo_fence;
@@ -574,6 +575,7 @@ import hpdcache_pkg::*;
     assign st1_req_is_amo_maxu     =     is_amo_maxu(st1_req.req.op);
     assign st1_req_is_amo_min      =      is_amo_min(st1_req.req.op);
     assign st1_req_is_amo_minu     =     is_amo_minu(st1_req.req.op);
+    assign st1_req_is_amo_cas      =     is_amo_cas(st1_req.req.op);
     assign st1_req_is_cmo_inval    =    is_cmo_inval(st1_req.req.op);
     assign st1_req_is_cmo_flush    =    is_cmo_flush(st1_req.req.op);
     assign st1_req_is_cmo_fence    =    is_cmo_fence(st1_req.req.op);
@@ -1202,6 +1204,7 @@ import hpdcache_pkg::*;
     assign uc_req_op_o.is_amo_maxu   = st1_req_is_amo_maxu;
     assign uc_req_op_o.is_amo_min    = st1_req_is_amo_min;
     assign uc_req_op_o.is_amo_minu   = st1_req_is_amo_minu;
+    assign uc_req_op_o.is_amo_cas    = st1_req_is_amo_cas;
     //  }}}
 
     //  CMO request handler outputs

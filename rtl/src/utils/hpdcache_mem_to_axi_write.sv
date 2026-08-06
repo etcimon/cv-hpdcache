@@ -97,6 +97,8 @@ import hpdcache_pkg::*;
                                                       axi_pkg::ATOP_LITTLE_END,
                                                       axi_pkg::ATOP_UMIN};
                     HPDCACHE_MEM_ATOMIC_SWAP: atop =  axi_pkg::ATOP_ATOMICSWAP;
+                    // Zacas AMOCAS (packed {cmp,swap} on W)
+                    HPDCACHE_MEM_ATOMIC_CMP:  atop =  axi_pkg::ATOP_ATOMICCMP;
                 endcase
             end
         endcase

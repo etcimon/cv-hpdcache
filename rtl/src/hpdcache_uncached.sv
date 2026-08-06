@@ -227,6 +227,11 @@ import hpdcache_pkg::*;
     logic                 mem_resp_write_valid_q, mem_resp_write_valid_d;
     logic                 mem_resp_read_valid_q, mem_resp_read_valid_d;
 
+    // Zacas AMOCAS local RMW: phase0 = load, phase1 = optional store
+    // (avoids AXI ATOP through multi-core hub/L2 which drops or mishandles R)
+    logic                 cas_store_q, cas_store_d;
+    logic                 cas_match;
+
     hpdcache_req_data_t   mem_req_write_data;
     logic [63:0]          amo_req_ld_data;
     logic [63:0]          amo_ld_data;
@@ -302,11 +307,13 @@ import hpdcache_pkg::*;
         lrsc_uc_reset          = 1'b0;
 
         uc_fsm_d               = uc_fsm_q;
+        cas_store_d            = cas_store_q;
 
         unique case (uc_fsm_q)
             //  Wait for a request
             //  {{{
             UC_IDLE: begin
+                cas_store_d = 1'b0;
 
                 if (req_valid_i) begin
                     wbuf_flush_all_o = 1'b1;
@@ -326,6 +333,7 @@ import hpdcache_pkg::*;
                         req_op_i.is_amo_maxu,
                         req_op_i.is_amo_min,
                         req_op_i.is_amo_minu,
+                        req_op_i.is_amo_cas,  // Zacas: local load→cmp→store
                         req_op_i.is_amo_lr: begin
                             //  Reset LR/SC reservation if AMO matches its address
                             lrsc_uc_reset = ~req_op_i.is_amo_lr & lrsc_uc_hit;
@@ -382,6 +390,24 @@ import hpdcache_pkg::*;
                     req_op_q.is_amo_lr: begin
                         if (mem_req_read_ready_i) begin
                             uc_fsm_d = UC_MEM_WAIT_RSP;
+                        end
+                    end
+
+                    // AMOCAS phase0: normal load of the CAS address
+                    req_op_q.is_amo_cas: begin
+                        if (!cas_store_q) begin
+                            if (mem_req_read_ready_i) begin
+                                uc_fsm_d = UC_MEM_WAIT_RSP;
+                            end
+                        end else begin
+                            // phase1: plain store of swap (if match)
+                            if (mem_req_write_ready_i && mem_req_write_data_ready_i) begin
+                                uc_fsm_d = UC_MEM_WAIT_RSP;
+                            end else if (mem_req_write_ready_i) begin
+                                uc_fsm_d = UC_MEM_WDATA_REQ;
+                            end else if (mem_req_write_data_ready_i) begin
+                                uc_fsm_d = UC_MEM_W_REQ;
+                            end
                         end
                     end
 
@@ -527,6 +553,34 @@ import hpdcache_pkg::*;
                             end
                         end
                     end
+                    // AMOCAS local RMW — decide one cycle after R so rsp_rdata_q is stable
+                    req_op_q.is_amo_cas: begin
+                        if (!cas_store_q) begin
+                            if (mem_resp_read_valid_q) begin
+                                if (rsp_error_q) begin
+                                    uc_fsm_d = UC_CORE_RSP;
+                                end else if (cas_match) begin
+                                    cas_store_d = 1'b1;
+                                    uc_fsm_d    = UC_MEM_REQ;
+                                end else begin
+                                    // mismatch: keep mem, return old value to core
+                                    uc_fsm_d = UC_CORE_RSP;
+                                end
+                            end
+                        end else begin
+                            // phase1 store of swap done — refresh L1 only on hit
+                            // (miss: following load refills from DRAM which has
+                            // the swap). Always complete to CORE_RSP.
+                            if (mem_resp_write_valid_i || mem_resp_write_valid_q) begin
+                                cas_store_d = 1'b0;
+                                if (!rsp_error_q && req_hit) begin
+                                    uc_fsm_d = UC_AMO_WRITE_DATA;
+                                end else begin
+                                    uc_fsm_d = UC_CORE_RSP;
+                                end
+                            end
+                        end
+                    end
                 endcase
             end
             //  }}}
@@ -586,8 +640,20 @@ import hpdcache_pkg::*;
 
     assign amo_ld_data = prepare_amo_data_operand(amo_req_ld_data, req_size_q,
             req_addr_q, amo_need_sign_extend(req_op_q));
-    assign amo_st_data = prepare_amo_data_operand(amo_req_st_data, req_size_q,
-            req_addr_q, amo_need_sign_extend(req_op_q));
+    // prepare_amo_data_operand keeps only the addressed 32-bit half for word
+    // AMOs. AMOCAS.W pack from the adapter is {cmp[31:0], swap[31:0]} in the
+    // full 64-bit wdata — preparing it would drop cmp and cas_match would
+    // always fail (mem never equals 0). Keep the raw pack for CAS.
+    assign amo_st_data = req_op_q.is_amo_cas
+        ? amo_req_st_data
+        : prepare_amo_data_operand(amo_req_st_data, req_size_q,
+                req_addr_q, amo_need_sign_extend(req_op_q));
+
+    // Word: prepared mem half vs cmp (high half of raw pack).
+    // Dword: raw wdata is swap only (expected not in 64b bus) — limited path.
+    assign cas_match = (req_size_q == hpdcache_req_size_t'(2))
+        ? (amo_ld_data[31:0] == amo_req_st_data[63:32])
+        : (amo_ld_data == amo_req_st_data);
 
     hpdcache_amo amo_unit_i (
         .ld_data_i           (amo_ld_data),
@@ -596,7 +662,24 @@ import hpdcache_pkg::*;
         .result_o            (amo_result)
     );
 
+    // Word CAS: only the addressed 4 bytes (adapter uses BE=0xff so the pack
+    // survives to this unit; phase-1 store must not clobber the neighbour).
+    hpdcache_req_be_t cas_word_be;
+    if (HPDcacheCfg.reqDataWidth >= 64) begin : gen_cas_word_be
+        always_comb begin
+            cas_word_be = '0;
+            if (req_addr_q[2])
+                cas_word_be[0][7:4] = 4'hf;
+            else
+                cas_word_be[0][3:0] = 4'hf;
+        end
+    end else begin : gen_cas_word_be_lt64
+        assign cas_word_be = req_be_q;
+    end
+
     assign data_amo_write_o = (uc_fsm_q == UC_AMO_WRITE_DATA);
+    // Only write L1 when the tag probe hit a way; way=0 with enable forced
+    // is a no-op / corrupt. On miss the following load refills from DRAM.
     assign data_amo_write_enable_o = req_hit;
     assign data_amo_write_set_o = req_addr_q[HPDcacheCfg.clOffsetWidth +: HPDcacheCfg.setWidth];
     assign data_amo_write_size_o = req_size_q;
@@ -615,18 +698,23 @@ import hpdcache_pkg::*;
         assign data_amo_write_merge = (hpdcache_uint'(req_size_q) < HPDcacheCfg.wordByteIdxWidth);
         always_comb
         begin : data_amo_write_merge_comb
+            automatic hpdcache_req_be_t be_use;
+            be_use = (req_op_q.is_amo_cas && req_size_q == hpdcache_req_size_t'(2))
+                ? cas_word_be : req_be_q;
             for (int i = 0; i < HPDcacheCfg.u.reqWords; i++) begin
                 for (int j = 0; j < HPDcacheCfg.u.wordWidth/8; j++) begin
-                    data_amo_write_be_o[i][j] = req_be_q[i][j] | data_amo_write_merge;
+                    data_amo_write_be_o[i][j] = be_use[i][j] | data_amo_write_merge;
                     data_amo_write_data_o[i][j*8 +: 8] =
-                        (     req_old_data_q[i][j*8 +: 8] & {8{~req_be_q[i][j]}}) |
-                        (data_amo_write_data[i][j*8 +: 8] & {8{ req_be_q[i][j]}});
+                        (     req_old_data_q[i][j*8 +: 8] & {8{~be_use[i][j]}}) |
+                        (data_amo_write_data[i][j*8 +: 8] & {8{ be_use[i][j]}});
                 end
             end
         end
     end else begin : gen_data_req_write_noecc
         assign data_amo_write_data_o = data_amo_write_data;
-        assign data_amo_write_be_o = req_be_q;
+        assign data_amo_write_be_o = (req_op_q.is_amo_cas &&
+                                      req_size_q == hpdcache_req_size_t'(2))
+            ? cas_word_be : req_be_q;
     end
 //  }}}
 
@@ -656,6 +744,10 @@ import hpdcache_pkg::*;
                 mem_req_read_o.mem_req_command = HPDCACHE_MEM_ATOMIC;
                 mem_req_read_o.mem_req_atomic  = HPDCACHE_MEM_ATOMIC_LDEX;
                 mem_req_read_valid_o           = (uc_fsm_q == UC_MEM_REQ);
+            end
+            // AMOCAS phase0: ordinary load
+            req_op_q.is_amo_cas: begin
+                mem_req_read_valid_o = (uc_fsm_q == UC_MEM_REQ) && !cas_store_q;
             end
             default: begin
                 mem_req_read_valid_o           = 1'b0;
@@ -716,6 +808,13 @@ import hpdcache_pkg::*;
                 mem_req_write_o.mem_req_command = HPDCACHE_MEM_ATOMIC;
                 mem_req_write_o.mem_req_atomic  = HPDCACHE_MEM_ATOMIC_UMIN;
             end
+            // AMOCAS phase1: plain store of computed swap (no ATOP)
+            req_op_q.is_amo_cas: begin
+                mem_req_write_o.mem_req_command = HPDCACHE_MEM_WRITE;
+                mem_req_write_o.mem_req_atomic  = HPDCACHE_MEM_ATOMIC_ADD;
+                // Write the swap value produced by the AMO unit
+                mem_req_write_data = data_amo_write_data;
+            end
             default: begin
                 mem_req_write_o.mem_req_command = HPDCACHE_MEM_WRITE;
                 mem_req_write_o.mem_req_atomic  = HPDCACHE_MEM_ATOMIC_ADD;
@@ -738,6 +837,11 @@ import hpdcache_pkg::*;
                     req_op_q.is_amo_minu: begin
                         mem_req_write_data_valid_o = 1'b1;
                         mem_req_write_valid_o      = 1'b1;
+                    end
+                    req_op_q.is_amo_cas: begin
+                        // only phase1 issues a write
+                        mem_req_write_data_valid_o = cas_store_q;
+                        mem_req_write_valid_o      = cas_store_q;
                     end
 
                     default: begin
@@ -764,6 +868,13 @@ import hpdcache_pkg::*;
         endcase
     end
 
+    // CAS.W phase-1: use word BE so the pack's transport BE (0xff) does not
+    // write both halves of the 64-bit bus lane.
+    hpdcache_req_be_t mem_req_write_be;
+    assign mem_req_write_be = (req_op_q.is_amo_cas &&
+                               req_size_q == hpdcache_req_size_t'(2))
+        ? cas_word_be : req_be_q;
+
     //  memory data width is bigger than the width of the core's interface
     if (MEM_REQ_RATIO > 1) begin : gen_upsize_mem_req_data
         //  replicate data
@@ -774,7 +885,7 @@ import hpdcache_pkg::*;
             .NOUTPUT     (MEM_REQ_RATIO),
             .DATA_WIDTH  (HPDcacheCfg.reqDataWidth/8)
         ) mem_write_be_demux_i (
-            .data_i      (req_be_q),
+            .data_i      (mem_req_write_be),
             .sel_i       (req_addr_q[$clog2(HPDcacheCfg.reqDataWidth/8) +:
                                      MEM_REQ_WORD_INDEX_WIDTH]),
             .data_o      (mem_req_write_data_o.mem_req_w_be)
@@ -784,7 +895,7 @@ import hpdcache_pkg::*;
     //  memory data width is equal to the width of the core's interface
     else begin : gen_eqsize_mem_req_data
         assign mem_req_write_data_o.mem_req_w_data = mem_req_write_data;
-        assign mem_req_write_data_o.mem_req_w_be   = req_be_q;
+        assign mem_req_write_data_o.mem_req_w_be   = mem_req_write_be;
     end
 
     assign mem_req_write_data_o.mem_req_w_last = 1'b1;
@@ -863,14 +974,18 @@ import hpdcache_pkg::*;
             req_need_rsp_q <= 1'b0;
             req_hit_way_q <= '0;
             req_old_data_q <= '0;
-        end else if (req_valid_i && req_ready_o) begin
-            req_op_q <= req_op_i;
-            req_addr_q <= req_addr_i;
-            req_size_q <= req_size_i;
-            req_uc_q <= req_uc_i;
-            req_need_rsp_q <= req_need_rsp_i;
-            req_hit_way_q <= req_hit_way_i;
-            req_old_data_q <= req_old_data_i;
+            cas_store_q <= 1'b0;
+        end else begin
+            if (req_valid_i && req_ready_o) begin
+                req_op_q <= req_op_i;
+                req_addr_q <= req_addr_i;
+                req_size_q <= req_size_i;
+                req_uc_q <= req_uc_i;
+                req_need_rsp_q <= req_need_rsp_i;
+                req_hit_way_q <= req_hit_way_i;
+                req_old_data_q <= req_old_data_i;
+            end
+            cas_store_q <= cas_store_d;
         end
     end
 //  }}}

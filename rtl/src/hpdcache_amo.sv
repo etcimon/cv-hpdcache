@@ -41,12 +41,32 @@ import hpdcache_pkg::*;
     logic signed [63:0] sum;
     logic               ugt, sgt;
 
+    // Zacas AMOCAS.W pack from cva6_hpdcache_if_adapter:
+    //   st_data = {cmp[31:0], swap[31:0]}
+    logic [31:0] cas_cmp_w, cas_swap_w;
+    logic [63:0] cas_result;
+
     assign ld_data = ld_data_i,
            st_data = st_data_i;
 
     assign ugt = (ld_data_i > st_data_i),
            sgt = (ld_data   > st_data),
            sum =  ld_data   + st_data;
+
+    // Zacas AMOCAS.W pack from cva6_hpdcache_if_adapter / hpdcache_uncached:
+    //   st_data = {cmp[31:0], swap[31:0]}
+    // Word path prepares ld into [31:0] (see prepare_amo_data_operand); BE
+    // selects the addressed half on store. Dword CAS uses adapter CASD FSM
+    // (expected in operand_c) — not this unit's pure-swap heuristic.
+    assign cas_cmp_w  = st_data_i[63:32];
+    assign cas_swap_w = st_data_i[31:0];
+    always_comb begin
+        // Word: compare prepared low half to cmp; result low = swap or old
+        if (ld_data_i[31:0] == cas_cmp_w)
+            cas_result = {cas_swap_w, cas_swap_w};
+        else
+            cas_result = ld_data_i;
+    end
 
     always_comb
     begin : amo_compute_comb
@@ -62,6 +82,9 @@ import hpdcache_pkg::*;
             op_i.is_amo_maxu : result_o = ugt ? ld_data_i : st_data_i;
             op_i.is_amo_min  : result_o = sgt ? st_data_i : ld_data_i;
             op_i.is_amo_minu : result_o = ugt ? st_data_i : ld_data_i;
+            // AMOCAS.W (pack) — cas_match in uncached FSM is authoritative for
+            // phase select; result drives store data when match.
+            op_i.is_amo_cas  : result_o = cas_result;
             default          : result_o = '0;
         endcase
     end
