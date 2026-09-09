@@ -21,6 +21,7 @@
  *  Authors       : Cesar Fuguet
  *  Creation Date : April, 2021
  *  Description   : Dcache memory request to axi write channels
+ *  Modified by   : Etienne Cimon
  *  History       :
  */
 module hpdcache_mem_to_axi_write
@@ -97,7 +98,11 @@ import hpdcache_pkg::*;
                                                       axi_pkg::ATOP_LITTLE_END,
                                                       axi_pkg::ATOP_UMIN};
                     HPDCACHE_MEM_ATOMIC_SWAP: atop =  axi_pkg::ATOP_ATOMICSWAP;
-                    // Zacas AMOCAS (packed {cmp,swap} on W)
+                    //  Zacas AMOCAS -> AXI5 AtomicCompare (packed {cmp,swap} on W).
+                    //  Dead in current config: hpdcache_uncached resolves CAS
+                    //  locally and never issues MEM_ATOMIC. Reachable only if
+                    //  the local RMW is removed -- which requires the hub/L2
+                    //  to honour ATOP and return R data.
                     HPDCACHE_MEM_ATOMIC_CMP:  atop =  axi_pkg::ATOP_ATOMICCMP;
                 endcase
             end

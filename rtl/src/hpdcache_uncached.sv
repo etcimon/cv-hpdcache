@@ -8,6 +8,7 @@
  *  Authors       : Cesar Fuguet
  *  Creation Date : May, 2021
  *  Description   : HPDcache uncached and AMO request handler
+ *  Modified by   : Etienne Cimon
  *  History       :
  */
 module hpdcache_uncached
@@ -393,7 +394,7 @@ import hpdcache_pkg::*;
                         end
                     end
 
-                    // AMOCAS phase0: normal load of the CAS address
+                    // AMOCAS. cas_store_q is the phase select (0=load, 1=store).
                     req_op_q.is_amo_cas: begin
                         if (!cas_store_q) begin
                             if (mem_req_read_ready_i) begin
@@ -553,7 +554,10 @@ import hpdcache_pkg::*;
                             end
                         end
                     end
-                    // AMOCAS local RMW — decide one cycle after R so rsp_rdata_q is stable
+                    // AMOCAS. Evaluate cas_match one cycle after the read
+                    // response so rsp_rdata_q is stable; phase1 then issues a
+                    // plain store (not an AXI ATOP). Accept live or registered
+                    // write response in phase1.
                     req_op_q.is_amo_cas: begin
                         if (!cas_store_q) begin
                             if (mem_resp_read_valid_q) begin
@@ -649,8 +653,10 @@ import hpdcache_pkg::*;
         : prepare_amo_data_operand(amo_req_st_data, req_size_q,
                 req_addr_q, amo_need_sign_extend(req_op_q));
 
-    // Word: prepared mem half vs cmp (high half of raw pack).
-    // Dword: raw wdata is swap only (expected not in 64b bus) — limited path.
+    // Word (size==2) is the only path that reaches here: AMOCAS.D/.Q are
+    // intercepted by the adapter's CASD_* FSM because 64b cmp + 64b swap do
+    // not fit in one req wdata. The else-branch compares ld against a
+    // swap-only wdata and is therefore a placeholder, not a correct dword CAS.
     assign cas_match = (req_size_q == hpdcache_req_size_t'(2))
         ? (amo_ld_data[31:0] == amo_req_st_data[63:32])
         : (amo_ld_data == amo_req_st_data);
@@ -678,8 +684,9 @@ import hpdcache_pkg::*;
     end
 
     assign data_amo_write_o = (uc_fsm_q == UC_AMO_WRITE_DATA);
-    // Only write L1 when the tag probe hit a way; way=0 with enable forced
-    // is a no-op / corrupt. On miss the following load refills from DRAM.
+    // data_amo_write_enable_o = req_hit is verbatim upstream (b25a160). CAS
+    // phase-1 relies on this gate: a miss skips the L1 update and the
+    // following refill brings the new value from DRAM.
     assign data_amo_write_enable_o = req_hit;
     assign data_amo_write_set_o = req_addr_q[HPDcacheCfg.clOffsetWidth +: HPDcacheCfg.setWidth];
     assign data_amo_write_size_o = req_size_q;
@@ -699,6 +706,8 @@ import hpdcache_pkg::*;
         always_comb
         begin : data_amo_write_merge_comb
             automatic hpdcache_req_be_t be_use;
+            // Word CAS: use only the addressed 4 bytes so the transport BE
+            // (0xff) does not clobber the neighbour word of the 64b bus.
             be_use = (req_op_q.is_amo_cas && req_size_q == hpdcache_req_size_t'(2))
                 ? cas_word_be : req_be_q;
             for (int i = 0; i < HPDcacheCfg.u.reqWords; i++) begin
@@ -712,6 +721,8 @@ import hpdcache_pkg::*;
         end
     end else begin : gen_data_req_write_noecc
         assign data_amo_write_data_o = data_amo_write_data;
+        // Word CAS: use only the addressed 4 bytes so the transport BE
+        // (0xff) does not clobber the neighbour word of the 64b bus.
         assign data_amo_write_be_o = (req_op_q.is_amo_cas &&
                                       req_size_q == hpdcache_req_size_t'(2))
             ? cas_word_be : req_be_q;
@@ -811,6 +822,8 @@ import hpdcache_pkg::*;
             // AMOCAS phase1: plain store of computed swap (no ATOP)
             req_op_q.is_amo_cas: begin
                 mem_req_write_o.mem_req_command = HPDCACHE_MEM_WRITE;
+                // ATOMIC field is don't-care for a WRITE command; ADD is the
+                // existing default-arm filler, not an add operation.
                 mem_req_write_o.mem_req_atomic  = HPDCACHE_MEM_ATOMIC_ADD;
                 // Write the swap value produced by the AMO unit
                 mem_req_write_data = data_amo_write_data;
@@ -839,7 +852,7 @@ import hpdcache_pkg::*;
                         mem_req_write_valid_o      = 1'b1;
                     end
                     req_op_q.is_amo_cas: begin
-                        // only phase1 issues a write
+                        // Only phase1 (cas_store_q==1) issues a write.
                         mem_req_write_data_valid_o = cas_store_q;
                         mem_req_write_valid_o      = cas_store_q;
                     end
@@ -976,6 +989,10 @@ import hpdcache_pkg::*;
             req_old_data_q <= '0;
             cas_store_q <= 1'b0;
         end else begin
+            // req_* capture is gated on the request handshake, but cas_store_q
+            // must advance every cycle: it is phase state for an in-flight CAS,
+            // not captured request state. Folding it back under the handshake
+            // (as in b25a160) would deadlock the two-phase FSM.
             if (req_valid_i && req_ready_o) begin
                 req_op_q <= req_op_i;
                 req_addr_q <= req_addr_i;

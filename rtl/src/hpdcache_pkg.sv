@@ -8,6 +8,7 @@
  *  Authors       : Cesar Fuguet
  *  Creation Date : April, 2021
  *  Description   : HPDcache Definitions Package
+ *  Modified by   : Etienne Cimon
  *  History       :
  */
 package hpdcache_pkg;
@@ -54,6 +55,8 @@ package hpdcache_pkg;
         HPDCACHE_REQ_AMO_MAXU              = 5'h0c,
         HPDCACHE_REQ_AMO_MIN               = 5'h0d,
         HPDCACHE_REQ_AMO_MINU              = 5'h0e,
+        //  Private LibreCore/adapter opcode. Was RESERVED upstream (b25a160);
+        //  a future upstream allocation of 5'h0f would silently alias CAS.
         HPDCACHE_REQ_AMO_CAS               = 5'h0f,  // Zacas AMOCAS (packed cmp||swap)
         HPDCACHE_REQ_CMO_FENCE             = 5'h10,
         HPDCACHE_REQ_CMO_PREFETCH          = 5'h11,
@@ -124,6 +127,9 @@ package hpdcache_pkg;
             HPDCACHE_REQ_AMO_MAXU,
             HPDCACHE_REQ_AMO_MIN,
             HPDCACHE_REQ_AMO_MINU,
+            //  CAS inherits AMO plumbing: wbuf flush-all, forced uncached
+            //  routing, and LR/SC reservation reset. Removing it from this
+            //  list silently breaks the local RMW.
             HPDCACHE_REQ_AMO_CAS:
                 return 1'b1;
             default:
@@ -292,6 +298,9 @@ package hpdcache_pkg;
         HPDCACHE_MEM_ATOMIC_UMAX = 4'b0110,
         HPDCACHE_MEM_ATOMIC_UMIN = 4'b0111,
         HPDCACHE_MEM_ATOMIC_SWAP = 4'b1000,
+        //  Currently unreachable: uncached CAS is a local two-phase RMW and
+        //  emits HPDCACHE_MEM_WRITE, not HPDCACHE_MEM_ATOMIC. Only the AXI
+        //  write adapter's case arm below consumes this encoding.
         HPDCACHE_MEM_ATOMIC_CMP  = 4'b1001,  // Zacas AMOCAS → AXI ATOP_ATOMICCMP
         //  Reserved           = 4'b1010,
         //  Reserved           = 4'b1011,
