@@ -546,6 +546,18 @@ import hpdcache_pkg::*;
                                     st2_dir_updt_valid_o = 1'b0;
                                     st2_dir_updt_wback_o = 1'b0;
                                     st2_dir_updt_dirty_o = 1'b0;
+                                    // The fetch bit must be cleared explicitly: the default
+                                    // st2_dir_updt_fetch_o = st2_dir_updt_fetch_i holds the
+                                    // sticky st2 register (1 after any preceding miss
+                                    // allocation), so this invalidation would otherwise
+                                    // leave the way "valid=0, fetch=1" -- unselectable as a
+                                    // victim forever (hpdcache_victim_plru: unused_ways =
+                                    // ~fetch & ~valid) and never rewritten by a refill or a
+                                    // NoC invalidation. Eight such ways in one set make every
+                                    // miss to that set park in the RTAB on dir_unavailable
+                                    // with an empty MSHR (G6LC T20 defect B). Matches upstream
+                                    // cv-hpdcache master.
+                                    st2_dir_updt_fetch_o = 1'b0;
                                 end
                             end
                         end
